@@ -1,140 +1,68 @@
-"""
-Reverse proxy for dragontournament.xyz
-- "/"           -> your landing page with the iframe
-- "/site/<path>"-> proxied copy of dragontournament.xyz (script-injected)
-- "/game.html"  -> your own game, served full-page (NOT in an iframe)
-"""
+from fastapi import FastAPI, Header, HTTPException, Depends
+from pydantic import BaseModel
+from typing import Optional
+import uvicorn
 
-from flask import Flask, request, Response, send_from_directory
-from urllib.parse import urljoin
-import requests
+app = FastAPI(
+    title="Device Security & Automation Controller",
+    docs_url=None,  # Swagger Docs डिसेबल कर दिया है ताकि सुरक्षा बनी रहे
+    redoc_url=None  # ReDoc UI डिसेबल
+)
 
-app = Flask(__name__, static_folder="static")
+# आपका गुप्त ऑथेंटिकेशन टोकन
+SECRET_API_KEY = "Dev69_SecureAuth_Token_987654321_X"
 
-TARGET = "https://flipkart.com"
+# API Key वेरिफिकेशन लॉजिक
+def verify_api_key(x_api_key: str = Header(...)):
+    if x_api_key != SECRET_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized Access - Invalid Secret Key")
+    return x_api_key
 
-# Headers that must never be copied straight through from the upstream response
-EXCLUDED_RESPONSE_HEADERS = {
-    "content-encoding", "content-length", "transfer-encoding", "connection",
-    "x-frame-options", "content-security-policy", "content-security-policy-report-only",
-}
+# कमांड क्यू (Queue) और टेलीमेट्री डेटा स्टोरेज
+pending_commands = []
+latest_telemetry = {"status": "NO_DATA", "timestamp": 0}
 
-# Script injected into every proxied HTML page.
-# It looks for the "Buy Now" button using a few common selector patterns.
-# >>> Edit the selector list below to match the REAL button on your page. <<<
-INJECT_SCRIPT = """
-<script>
-(function () {
-  function wireStartButton() {
-    var selectors = [
-      '#startGameBtn',
-      '#start-game',
-      '.start-game-btn',
-      '[data-action="start-game"]',
-      'button:contains("Buy Now")'  // not valid CSS, kept only as a reminder to check manually
-    ];
-    var btn = null;
-    for (var i = 0; i < selectors.length; i++) {
-      try {
-        var el = document.querySelector(selectors[i]);
-        if (el) { btn = el; break; }
-      } catch (e) { /* ignore invalid selector like :contains */ }
-    }
-    // Fallback: search all buttons/links by visible text
-    if (!btn) {
-      var candidates = document.querySelectorAll('button, a, div, span');
-      for (var j = 0; j < candidates.length; j++) {
-        if (candidates[j].textContent.trim().toLowerCase() === 'Buy Now') {
-          btn = candidates[j];
-          break;
-        }
-      }
-    }
-    if (btn) {
-      btn.addEventListener('click', function (e) {
-        e.preventDefault();
-        e.stopPropagation();
-        // Break out of the iframe entirely, load the game full page
-        window.top.location.href = '/game.html';
-      });
-    }
-  }
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', wireStartButton);
-  } else {
-    wireStartButton();
-  }
-})();
-</script>
-"""
+# Pydantic डेटा मॉडल्स
+class TelemetryPayload(BaseModel):
+    deviceId: str
+    timestamp: int
+    batteryLevel: int
+    status: str
+
+class CommandResponse(BaseModel):
+    command: Optional[str] = None
+    payload: Optional[str] = None
+
+class CommandIssue(BaseModel):
+    command: str
+    payload: Optional[str] = None
 
 
-def rewrite_html(html: str, base_url: str) -> str:
-    """Inject our script and make sure a <base> tag exists so relative
-    assets (css/js/img) still resolve against the real site."""
-    if "<base " not in html and "<head>" in html:
-        html = html.replace("<head>", f'<head><base href="{base_url}/">', 1)
-    if "</body>" in html:
-        html = html.replace("</body>", INJECT_SCRIPT + "</body>")
-    else:
-        html += INJECT_SCRIPT
-    return html
+# 1. हेल्थ चेक एंडपॉइंट (सामान्य रिस्पॉन्स ताकि किसी को सर्वर का पता न चले)
+@app.get("/")
+def health_check():
+    return {"status": "online", "message": "Server is active"}
 
+# 2. टेलीमेट्री रिसीव करने का एंडपॉइंट (DeviceX से डेटा प्राप्त करना)
+@app.post("/api/v1/telemetry", status_code=200)
+async def receive_telemetry(data: TelemetryPayload, api_key: str = Depends(verify_api_key)):
+    global latest_telemetry
+    latest_telemetry = data.dict()
+    return {"status": "success"}
 
-@app.route("/")
-def index():
-    return """
-<!DOCTYPE html>
-<html>
-<head>
-  <title>Dragon Tournament</title>
-  <style>
-    html, body { margin:0; padding:0; height:100%; overflow:hidden; }
-    iframe { border:none; width:100vw; height:100vh; display:block; }
-  </style>
-</head>
-<body>
-  <iframe src="/site/" allow="fullscreen"></iframe>
-</body>
-</html>
-"""
+# 3. पेंडिंग कमांड फेच करने का एंडपॉइंट (DeviceX हर 15 सेकंड में यहाँ से कमांड लेगा)
+@app.get("/api/v1/command/fetch", response_model=CommandResponse)
+async def fetch_pending_commands(api_key: str = Depends(verify_api_key)):
+    if pending_commands:
+        cmd = pending_commands.pop(0)
+        return cmd
+    return CommandResponse(command=None, payload=None)
 
+# 4. कमांड इश्यू करने का एंडपॉइंट (यह केवल आपकी dashboard.html फाइल से ट्रिगर होगा)
+@app.post("/api/v1/command/issue")
+async def issue_command(cmd: CommandIssue, api_key: str = Depends(verify_api_key)):
+    pending_commands.append({"command": cmd.command, "payload": cmd.payload})
+    return {"status": "queued", "command": cmd.command}
 
-@app.route("/site/", defaults={"path": ""})
-@app.route("/site/<path:path>")
-def proxy(path):
-    upstream_url = urljoin(TARGET + "/", path)
-
-    upstream_resp = requests.get(
-        upstream_url,
-        params=request.args,
-        headers={"User-Agent": request.headers.get("User-Agent", "Mozilla/5.0")},
-        timeout=15,
-    )
-
-    content_type = upstream_resp.headers.get("Content-Type", "")
-
-    if "text/html" in content_type:
-        body = rewrite_html(upstream_resp.text, TARGET)
-        resp = Response(body, upstream_resp.status_code)
-    else:
-        # css/js/images/fonts etc. pass through unchanged
-        resp = Response(upstream_resp.content, upstream_resp.status_code)
-
-    for key, value in upstream_resp.headers.items():
-        if key.lower() not in EXCLUDED_RESPONSE_HEADERS:
-            resp.headers[key] = value
-    if content_type:
-        resp.headers["Content-Type"] = content_type
-
-    return resp
-
-
-@app.route("/game.html")
-def game():
-    # Served full-page, outside any iframe
-    return send_from_directory(app.static_folder, "game.html")
-
-
-if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+if name == "main":
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
